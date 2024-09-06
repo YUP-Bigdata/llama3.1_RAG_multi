@@ -1,0 +1,9 @@
+cluster.name: "docker-cluster"
+network.host: 0.0.0.0
+
+path.data: /usr/share/elasticsearch/data
+
+xpack.security.enabled: true
+xpack.security.http.ssl.enabled: false
+xpack.monitoring.collection.enabled: true
+xpack.security.authc.api_key.enabled: true
