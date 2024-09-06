@@ -1,0 +1,5 @@
+# .env 파일 무시
+./ELK_docker/.env
+
+# config.py 파일 무시
+./config/config.py
