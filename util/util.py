@@ -21,10 +21,11 @@ class Util:
         scores = self.reranker.compute_score(search_data)
         
         # 음수 점수를 제외하고 정렬
-        filtered_results = [(score, search_results[i]) for i, score in enumerate(scores) if score > 0]
+        # filtered_results = [(score, search_results[i]) for i, score in enumerate(scores) if score > 0]
+        filtered_results = [(score, search_results[i]) for i, score in enumerate(scores)]
         filtered_results.sort(key=lambda x: x[0], reverse=True)
         
-        # 상위 10개 추출 (부족할 경우 해당 수만큼 반환)
+        # 상위 5개 추출 (부족할 경우 해당 수만큼 반환)
         top_results = [result[1] for result in filtered_results[:5]]
         
         if not top_results:

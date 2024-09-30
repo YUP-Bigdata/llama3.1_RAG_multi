@@ -9,7 +9,13 @@ class Document:
         self.page_content = page_content
 
     def __repr__(self):
-        return f"Document(metadata={self.metadata}, page_content={repr(self.page_content)})"
+        return f"Document(metadata={self.metadata}, page_content={self.page_content})"
+    
+    def to_dict(self):
+        return {
+            "metadata": self.metadata,
+            "page_content": self.page_content
+        }
 
 def save_all_documents_to_single_json(documents, output_file="documents.json"):
     all_docs_dicts = [{

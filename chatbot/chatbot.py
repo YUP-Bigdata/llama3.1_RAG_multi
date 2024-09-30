@@ -1,15 +1,18 @@
+#QWEN 2.5
+
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, TextStreamer,BitsAndBytesConfig
 from langchain_elasticsearch.vectorstores import ElasticsearchStore
 from elasticsearch import Elasticsearch
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents.base import Document
+from document_processing.document_utils import contains_chinese
 from config import ES_USER, ES_PASSWORD, ES_URL, ES_INDEX, ES_HISTORY_INDEX
 from langchain.prompts import PromptTemplate
 from langchain_huggingface import HuggingFacePipeline
 from langchain.schema import BaseOutputParser
 from langchain.schema.runnable import RunnablePassthrough
 from util.util import Util
-from document_processing.document_utils import contains_chinese, hanja_translate
 from datetime import datetime
 import time
 import warnings
@@ -33,24 +36,73 @@ class RerankRetrieverWrapper:
 # 히스토리 관리를 위한 클래스
 class ConversationHistory:
     def __init__(self, es_history_index, es_url, es_user, es_password):
-        # Initialize Elasticsearch client
         self.es_client = Elasticsearch(
             es_url,
             basic_auth=(es_user, es_password)
         )
         self.es_history_index = es_history_index
+        self.create_index_if_not_exists()  # 인덱스가 없으면 생성
 
-    def save_history(self, session_id, question, answer):
-        timestamp_iso = datetime.utcfromtimestamp(time.time()).isoformat()
-        document = {
-            'session_id': session_id,
-            'question': question,
-            'answer': answer,
-            'timestamp': timestamp_iso  
-        }
-        # Save document in the specified history index
-        self.es_client.index(index=self.es_history_index, body=document)
+    def create_index_if_not_exists(self):
+        # 인덱스가 존재하는지 확인
+        if not self.es_client.indices.exists(index=self.es_history_index):
+            # 인덱스 설정 (필요에 따라 매핑과 설정을 추가할 수 있습니다)
+            index_settings = {
+                "mappings": {
+                    "properties": {
+                        "session_id": {"type": "keyword"},
+                        "question": {"type": "text"},
+                        "context": {  # Change 'context' to nested type
+                            "type": "nested",  # or "object"
+                            "properties": {
+                                "metadata": {
+                                    "properties": {
+                                        "source": {"type": "text"},
+                                        "paragraph_number": {"type": "integer"}
+                                    }
+                                },
+                                "page_content": {"type": "text"}
+                            }
+                        },
+                        "answer": {"type": "text"},
+                        "timestamp": {"type": "date"}
+                    }
+                }
+            }
 
+            # 인덱스 생성
+            self.es_client.indices.create(index=self.es_history_index, body=index_settings)
+
+    # 히스토리 저장 함수 수정
+    
+
+    def save_history(self, session_id, question, context, answer):
+        try:
+            timestamp_iso = datetime.fromtimestamp(time.time()).isoformat()
+            
+            # Document 객체로 context 데이터를 처리하고, score도 추가
+            serialized_context = [
+                {
+                    'metadata': doc.metadata if isinstance(doc, Document) else {},
+                    'page_content': doc.page_content if isinstance(doc, Document) else "",
+                    'score': doc.score if hasattr(doc, 'score') else None  # score 추가
+                } for doc in context
+            ]
+
+            document = {
+                'session_id': session_id,
+                'question': question,
+                'context': serialized_context,  # 변환된 context 사용
+                'answer': answer,
+                'timestamp': timestamp_iso  
+            }
+
+            self.es_client.index(index=self.es_history_index, body=document)
+        except Exception as e:
+            print(f"저장 중 오류 발생: {e}")
+
+
+    # retrieve_history는 기존과 동일하게 유지
     def retrieve_history(self, session_id, limit=5):
         query = {
             "query": {
@@ -61,9 +113,9 @@ class ConversationHistory:
                 {"timestamp": {"order": "desc"}}
             ]
         }
-        # Retrieve documents from Elasticsearch
         results = self.es_client.search(index=self.es_history_index, body=query)
         return [(hit['_source']['question'], hit['_source']['answer']) for hit in results['hits']['hits']]
+
 
 # 벡터 저장소 호출 함수
 def vectorstore_call(model_name, model_kwargs, encode_kwargs):
@@ -72,7 +124,6 @@ def vectorstore_call(model_name, model_kwargs, encode_kwargs):
         model_kwargs=model_kwargs,
         encode_kwargs=encode_kwargs
     )
-
     return ElasticsearchStore(
         index_name=ES_INDEX,
         embedding=embedding_model,
@@ -82,16 +133,34 @@ def vectorstore_call(model_name, model_kwargs, encode_kwargs):
     )
 
 # 커스텀 파서
+# class CustomOutputParser(BaseOutputParser):
+#     def parse(self, text: str) -> str:
+#         split_text = text.split('<|start_header_id|>assistant<|end_header_id|>\n', 1)
+#         if len(split_text) > 1:
+#             result = split_text[1].strip()
+#             while contains_chinese(result):
+#                 result = hanja_translate(result)
+#             return result
+#         else:
+#             return text
+
 class CustomOutputParser(BaseOutputParser):
     def parse(self, text: str) -> str:
-        split_text = text.split('<|start_header_id|>assistant<|end_header_id|>\n', 1)
+        # Split the text to find the part after "Answer:"
+        split_text = text.split('Answer: <|im_end|>', 1)
         if len(split_text) > 1:
+            # Extract the part after "Answer:" and strip any extra whitespace
             result = split_text[1].strip()
-            while contains_chinese(result):
-                result = hanja_translate(result)
             return result
         else:
+            # If "Answer:" isn't found, return the original text
             return text
+
+
+def context_extract(rerank_wrapper, question):
+    context = rerank_wrapper({"question": question})['context']
+    return context
+
 
 # 챗봇 실행 설정 함수
 def setup_and_run_chatbot():
@@ -103,36 +172,45 @@ def setup_and_run_chatbot():
     vectorstore = vectorstore_call(model_name, model_kwargs, encode_kwargs)
 
     # 챗봇 모델 설정
-    model_id = "OpenBuddy/openbuddy-llama3.1-8b-v22.1-131k"
-    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    model_id = "Qwen/Qwen2.5-14B-Instruct"
+    bnb_config = BitsAndBytesConfig(load_in_4bit=True)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        quantization_config=bnb_config,
+        quantization_config=bnb_config,  # Ensuring the 8-bit quantization is used
         torch_dtype=torch.bfloat16,
         device_map='auto'
     )
+    model.gradient_checkpointing_enable()
+
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
     pipe = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        max_new_tokens=1024,
-        do_sample=True,
-        repetition_penalty=1.2,
-        temperature=0.8
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=512,
+    do_sample=True,
+    repetition_penalty=1.2,
+    streamer=streamer,
+    temperature=0.7,  # Reduced for more fluent output
+    top_p=0.9         # Nucleus sampling for better coherence
     )
+
 
     hf_pipeline = HuggingFacePipeline(pipeline=pipe)
 
-    # 프롬프트 템플릿 설정
-    prompt_template = PromptTemplate.from_template("""
-        <|begin_of_text|><|start_header_id|>system<|end_header_id|>당신은 질문에 답하는 작업을 위한 어시스턴트입니다. 제공된 문맥을 기반으로 질문에 답하려고 노력하세요. 이전 대화는 단순 참고용으로만 사용하며, 중요한 정보가 아니면 새로운 질문에 중점을 두고 답변하세요. 문맥이 충분하지 않더라도 답변할 수 있는 질문이면 최대한 정확하고 유익하게 답변하세요. 답을 모를 경우에는 모른다고 솔직하게 말하세요. 소스나 단락 번호와 같은 메타데이터는 포함하지 마세요. 응답은 세 문장 이내로 작성하되, 문맥에서 중요한 정보를 충분히 반영하여 답변을 풍부하게 만드세요. 오직 한국어만 사용하고, 다른 언어는 절대 사용하지 마세요.<|eot_id|><|start_header_id|>user<|end_header_id|>
-        Question: {question}
-        Context: {context}
-        Answer: <|eot_id|><|start_header_id|>assistant<|end_header_id|>
-        """)
+    # Prompt Template
+    temp = """<|im_start|>System: 您是一位友善的助手，通过阅读上下文并回答问题。仅参考上下文和之前的对话记录中的信息进行回答。请只用韩语回答。如果无法根据上下文中的信息回答，请回答“모르겠습니다。”
 
+Question: {question}
+
+Context: {context}
+
+Answer: <|im_end|>
+"""
+
+    prompt_template = PromptTemplate.from_template(temp)
 
     retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
 
@@ -155,23 +233,26 @@ def setup_and_run_chatbot():
         if question.lower() == 'exit':
             break
         elif not question.strip():
-            print("질문이 입력되지 않았습니다. 다시 입력해주세요.")
+            print("질문이 입력되지 않았습니다. 다시s 입력해주세요.")
             continue
         
         # 히스토리 불러오기 - 가장 최근 3개의 기록만 불러오기
         history_data = conversation_history.retrieve_history(session_id, limit=3)
+        # print(history_data)
         history_text = "\n".join([f"Q: {q}\nA: {a}" for q, a in history_data])
-
         # 프롬프트에 히스토리 추가
-        prompt_with_history = f"{history_text}\n\nQ: {question}\nA: "
-        
+        prompt_with_history = f"Hisroty: {history_text}\n\nQuestion: {question}\nAnswer: "
+        # print(prompt_with_history)
         start_time = time.time() 
         # 질문과 히스토리를 포함한 context를 랭킹하고, RAG 체인으로 답변 생성
         response = rag_chain.invoke({"question": question, "context": prompt_with_history})
-
-        # 응답 저장
-        conversation_history.save_history(session_id, question, response)
+        if contains_chinese(response):
+            pass
+        else:
+            context = context_extract(rerank_wrapper,question)
+            # 응답 저장
+            conversation_history.save_history(session_id, question, context, response)
         
         print('작업 수행된 시간 : %f 초' % (time.time() - start_time))
-        print("답변:", response)
+        # print("답변:", response)
 

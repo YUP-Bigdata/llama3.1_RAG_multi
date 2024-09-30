@@ -3,7 +3,7 @@ import re
 from tqdm import tqdm
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer, LTTextLineHorizontal
-# from translation.translate import pdf_translate, translate_model_call
+from translation.translate import pdf_translate, translate_model_call
 from document_processing.document_utils import save_all_documents_to_single_json, update_documents_with_translation, Document
 
 def find_pdf_files(dir_path):
