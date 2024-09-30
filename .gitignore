@@ -3,3 +3,4 @@
 
 # config.py 파일 무시
 ./config/config.py
+*.pyc
